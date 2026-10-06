@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   AuditEvent,
@@ -33,6 +33,10 @@ export function TicketDashboard() {
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [investigating, setInvestigating] = useState(false);
+  const [reviewer, setReviewer] = useState("Operations reviewer");
+  const [reviewNote, setReviewNote] = useState("");
+  const [workflowBusy, setWorkflowBusy] = useState(false);
+  const executionKeys = useRef<Record<number, string>>({});
 
   const loadData = useCallback(async () => {
     try {
@@ -58,6 +62,7 @@ export function TicketDashboard() {
   useEffect(() => {
     if (selectedId === null) return;
     let active = true;
+    setReviewNote("");
     Promise.all([api.getRecommendations(selectedId), api.getEvents(selectedId)])
       .then(([recommendations, auditEvents]) => {
         if (!active) return;
@@ -125,6 +130,55 @@ export function TicketDashboard() {
       setError(err instanceof Error ? err.message : "Investigation failed");
     } finally {
       setInvestigating(false);
+    }
+  }
+
+  async function refreshInvestigation(ticketId: number) {
+    const [recommendations, auditEvents] = await Promise.all([
+      api.getRecommendations(ticketId),
+      api.getEvents(ticketId),
+    ]);
+    setRecommendation(recommendations[0] ?? null);
+    setEvents(auditEvents);
+  }
+
+  async function submitDecision(decision: "approve" | "reject") {
+    if (!selected || !recommendation) return;
+    if (!reviewer.trim()) {
+      setError("Reviewer name is required");
+      return;
+    }
+    setWorkflowBusy(true);
+    setError(null);
+    try {
+      const updated = decision === "approve"
+        ? await api.approveRecommendation(selected.id, recommendation.id, reviewer.trim(), reviewNote.trim())
+        : await api.rejectRecommendation(selected.id, recommendation.id, reviewer.trim(), reviewNote.trim());
+      setRecommendation(updated);
+      setReviewNote("");
+      setEvents(await api.getEvents(selected.id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not record the review decision");
+    } finally {
+      setWorkflowBusy(false);
+    }
+  }
+
+  async function executeRecommendation() {
+    if (!selected || !recommendation) return;
+    const existingKey = recommendation.execution?.idempotency_key ?? executionKeys.current[recommendation.id];
+    const idempotencyKey = existingKey ?? crypto.randomUUID();
+    executionKeys.current[recommendation.id] = idempotencyKey;
+    setWorkflowBusy(true);
+    setError(null);
+    try {
+      await api.executeRecommendation(selected.id, recommendation.id, idempotencyKey);
+      await Promise.all([refreshInvestigation(selected.id), loadData()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Action execution failed");
+      await refreshInvestigation(selected.id).catch(() => undefined);
+    } finally {
+      setWorkflowBusy(false);
     }
   }
 
@@ -253,8 +307,45 @@ export function TicketDashboard() {
                     </div>
                     <div className="recommended-action">
                       <div><span>Recommended action</span><strong>{humanize(recommendation.recommended_action)}</strong></div>
-                      {recommendation.requires_approval && <span className="approval-chip">Approval required</span>}
+                      <span className={`workflow-chip ${recommendation.workflow_state}`}>{humanize(recommendation.workflow_state)}</span>
                     </div>
+                    {recommendation.workflow_state === "pending_approval" && (
+                      <div className="approval-panel">
+                        <div><p className="section-label">Human review required</p><p>Verify the cited evidence before authorizing this action.</p></div>
+                        <div className="review-fields">
+                          <label>Reviewer<input value={reviewer} maxLength={200} onChange={(event) => setReviewer(event.target.value)} /></label>
+                          <label>Review note<textarea value={reviewNote} maxLength={2000} rows={3} placeholder="Optional rationale for the audit trail" onChange={(event) => setReviewNote(event.target.value)} /></label>
+                        </div>
+                        <div className="workflow-actions">
+                          <button className="secondary-button reject-button" disabled={workflowBusy} onClick={() => void submitDecision("reject")}>Reject</button>
+                          <button className="primary-button" disabled={workflowBusy} onClick={() => void submitDecision("approve")}>{workflowBusy ? "Saving…" : "Approve recommendation"}</button>
+                        </div>
+                      </div>
+                    )}
+                    {recommendation.approval && (
+                      <div className={`decision-summary ${recommendation.approval.decision}`}>
+                        <strong>{humanize(recommendation.approval.decision)} by {recommendation.approval.reviewer}</strong>
+                        {recommendation.approval.note && <p>{recommendation.approval.note}</p>}
+                        <time>{formatDate(recommendation.approval.created_at)}</time>
+                      </div>
+                    )}
+                    {(["ready", "approved", "failed"] as const).includes(recommendation.workflow_state as "ready" | "approved" | "failed") && (
+                      <div className="execution-panel">
+                        <div>
+                          <p className="section-label">Action execution</p>
+                          <p>{recommendation.workflow_state === "failed" ? recommendation.execution?.error : "The action will run against the simulated external service."}</p>
+                        </div>
+                        <button className="primary-button" disabled={workflowBusy} onClick={() => void executeRecommendation()}>
+                          {workflowBusy ? "Executing…" : recommendation.workflow_state === "failed" ? "Retry action" : "Execute action"}
+                        </button>
+                      </div>
+                    )}
+                    {recommendation.execution?.status === "completed" && (
+                      <div className="execution-result">
+                        <div><p className="section-label">Execution completed</p><strong>{String(recommendation.execution.result.message ?? "Action completed")}</strong></div>
+                        <span>{recommendation.execution.external_reference}</span>
+                      </div>
+                    )}
                     <div className="recommendation-footer"><span>Generated via {recommendation.provider}</span><button onClick={() => void investigate()} disabled={investigating}>{investigating ? "Investigating…" : "Run again"}</button></div>
                   </div>
                 ) : (

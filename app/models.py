@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -92,6 +92,57 @@ class Recommendation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     ticket: Mapped[Ticket] = relationship(back_populates="recommendations")
+    approval: Mapped["ApprovalDecision | None"] = relationship(
+        back_populates="recommendation", uselist=False
+    )
+    execution: Mapped["ActionExecution | None"] = relationship(
+        back_populates="recommendation", uselist=False
+    )
+
+    @property
+    def workflow_state(self) -> str:
+        if self.execution is not None:
+            return self.execution.status
+        if self.approval is not None:
+            return self.approval.decision
+        return "pending_approval" if self.requires_approval else "ready"
+
+
+class ApprovalDecision(Base):
+    __tablename__ = "approval_decisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    recommendation_id: Mapped[int] = mapped_column(
+        ForeignKey("recommendations.id"), unique=True, index=True
+    )
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"), index=True)
+    decision: Mapped[str] = mapped_column(String(30))
+    reviewer: Mapped[str] = mapped_column(String(200))
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    recommendation: Mapped[Recommendation] = relationship(back_populates="approval")
+
+
+class ActionExecution(Base):
+    __tablename__ = "action_executions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    recommendation_id: Mapped[int] = mapped_column(
+        ForeignKey("recommendations.id"), unique=True, index=True
+    )
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id"), index=True)
+    action: Mapped[str] = mapped_column(String(100))
+    idempotency_key: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(30), default="executing", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    external_reference: Mapped[str | None] = mapped_column(String(100))
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    recommendation: Mapped[Recommendation] = relationship(back_populates="execution")
 
 
 class AuditEvent(Base):

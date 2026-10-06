@@ -3,9 +3,10 @@
 OpsPilot is an operations-resolution platform that will investigate support tickets, gather
 evidence, recommend actions, require approval for sensitive changes, and retain an audit trail.
 
-The current milestone includes a FastAPI and PostgreSQL API, a Next.js operations dashboard, and
-an evidence-based investigation workflow. Investigations retrieve account, invoice, and knowledge
-records, produce a schema-validated recommendation, and retain an audit timeline.
+The current milestone includes a FastAPI and PostgreSQL API, a Next.js operations dashboard, an
+evidence-based investigation workflow, and human-controlled action execution. Investigations
+retrieve account, invoice, and knowledge records, produce a schema-validated recommendation, and
+retain an audit timeline. Sensitive actions require an explicit approval before execution.
 
 ## Quick start without Docker
 
@@ -82,6 +83,9 @@ Tests use a temporary local SQLite database, so they do not require PostgreSQL.
 - Create new tickets for existing customers
 - Investigate tickets using retrieved operational evidence
 - View structured diagnoses, confidence, cited evidence, and recommended actions
+- Approve or reject sensitive recommendations with a reviewer and rationale
+- Execute approved actions against a simulated external service
+- Retry failed executions safely with idempotency keys
 - Review an immutable activity timeline for each ticket
 - Responsive layout for desktop and mobile
 
@@ -97,7 +101,14 @@ Tests use a temporary local SQLite database, so they do not require PostgreSQL.
 - `PATCH /tickets/{id}`
 - `POST /tickets/{id}/investigate`
 - `GET /tickets/{id}/recommendations`
+- `POST /tickets/{id}/recommendations/{recommendation_id}/approve`
+- `POST /tickets/{id}/recommendations/{recommendation_id}/reject`
+- `POST /tickets/{id}/recommendations/{recommendation_id}/execute`
 - `GET /tickets/{id}/events`
+
+The execute endpoint requires an `Idempotency-Key` header. Repeating a completed request with the
+same key returns the original execution, while failed requests can be retried with that key. The
+simulated adapter returns a stable external reference and never contacts a real billing system.
 
 ## Investigation modes
 
@@ -145,5 +156,6 @@ and incurs usage; use `demo` mode for the free deterministic baseline.
 
 ## Next milestone
 
-Add a human approval workflow and a simulated external billing API. Approved actions should be
-idempotent, retry-safe, and recorded in the audit timeline.
+Add authentication and role-based access control, move investigations and action execution to a
+background worker, and add production observability for model latency, token usage, cost, provider
+errors, approval rates, and execution outcomes.

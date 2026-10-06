@@ -17,11 +17,21 @@ InvestigationCategory = Literal[
 RecommendedAction = Literal[
     "issue_partial_credit",
     "refund_duplicate_charge",
+    "review_invoice",
     "reset_credentials",
     "approve_cancellation",
     "request_more_information",
     "no_action",
     "escalate",
+]
+WorkflowState = Literal[
+    "pending_approval",
+    "ready",
+    "approved",
+    "rejected",
+    "executing",
+    "completed",
+    "failed",
 ]
 
 
@@ -108,6 +118,38 @@ class InvestigationResult(BaseModel):
     requires_approval: bool
 
 
+class ApprovalDecisionCreate(BaseModel):
+    reviewer: str = Field(min_length=1, max_length=200)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class ApprovalDecisionRead(ApprovalDecisionCreate):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    recommendation_id: int
+    ticket_id: int
+    decision: Literal["approved", "rejected"]
+    created_at: datetime
+
+
+class ActionExecutionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    recommendation_id: int
+    ticket_id: int
+    action: RecommendedAction
+    idempotency_key: str
+    status: Literal["executing", "completed", "failed"]
+    attempts: int
+    external_reference: str | None
+    result: dict
+    error: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+
 class RecommendationRead(InvestigationResult):
     model_config = ConfigDict(from_attributes=True)
 
@@ -115,6 +157,9 @@ class RecommendationRead(InvestigationResult):
     ticket_id: int
     provider: str
     created_at: datetime
+    workflow_state: WorkflowState
+    approval: ApprovalDecisionRead | None = None
+    execution: ActionExecutionRead | None = None
 
 
 class AuditEventRead(BaseModel):

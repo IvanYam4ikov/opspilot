@@ -1,16 +1,27 @@
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
-from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app import actions
 from app.config import settings
 from app.database import Base, engine, get_db
 from app.investigation import generate_recommendation, retrieve_context
-from app.models import AuditEvent, Customer, Recommendation, Ticket
+from app.models import (
+    ActionExecution,
+    ApprovalDecision,
+    AuditEvent,
+    Customer,
+    Recommendation,
+    Ticket,
+)
 from app.schemas import (
+    ActionExecutionRead,
+    ApprovalDecisionCreate,
     AuditEventRead,
     CustomerCreate,
     CustomerRead,
@@ -189,6 +200,200 @@ def investigate_ticket(ticket_id: int, db: Session = Depends(get_db)) -> Recomme
     db.commit()
     db.refresh(recommendation)
     return recommendation
+
+
+def _get_recommendation(db: Session, ticket_id: int, recommendation_id: int) -> Recommendation:
+    recommendation = db.get(Recommendation, recommendation_id)
+    if recommendation is None or recommendation.ticket_id != ticket_id:
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    return recommendation
+
+
+def _record_decision(
+    db: Session,
+    ticket_id: int,
+    recommendation_id: int,
+    payload: ApprovalDecisionCreate,
+    decision_value: str,
+) -> Recommendation:
+    recommendation = _get_recommendation(db, ticket_id, recommendation_id)
+    if recommendation.execution is not None:
+        raise HTTPException(status_code=409, detail="An executed recommendation cannot be reviewed")
+    if recommendation.approval is not None:
+        if recommendation.approval.decision == decision_value:
+            return recommendation
+        raise HTTPException(status_code=409, detail="The recommendation already has a decision")
+
+    decision = ApprovalDecision(
+        recommendation_id=recommendation.id,
+        ticket_id=ticket_id,
+        decision=decision_value,
+        reviewer=payload.reviewer,
+        note=payload.note,
+    )
+    recommendation.approval = decision
+    db.add_all(
+        [
+            decision,
+            AuditEvent(
+                ticket_id=ticket_id,
+                event_type=f"recommendation_{decision_value}",
+                message=f"Recommendation {decision_value} by {payload.reviewer}",
+                event_metadata={
+                    "recommendation_id": recommendation.id,
+                    "reviewer": payload.reviewer,
+                    "note": payload.note,
+                },
+            ),
+        ]
+    )
+    db.commit()
+    db.refresh(recommendation)
+    return recommendation
+
+
+@app.post(
+    "/tickets/{ticket_id}/recommendations/{recommendation_id}/approve",
+    response_model=RecommendationRead,
+)
+def approve_recommendation(
+    ticket_id: int,
+    recommendation_id: int,
+    payload: ApprovalDecisionCreate,
+    db: Session = Depends(get_db),
+) -> Recommendation:
+    return _record_decision(db, ticket_id, recommendation_id, payload, "approved")
+
+
+@app.post(
+    "/tickets/{ticket_id}/recommendations/{recommendation_id}/reject",
+    response_model=RecommendationRead,
+)
+def reject_recommendation(
+    ticket_id: int,
+    recommendation_id: int,
+    payload: ApprovalDecisionCreate,
+    db: Session = Depends(get_db),
+) -> Recommendation:
+    return _record_decision(db, ticket_id, recommendation_id, payload, "rejected")
+
+
+@app.post(
+    "/tickets/{ticket_id}/recommendations/{recommendation_id}/execute",
+    response_model=ActionExecutionRead,
+)
+def execute_recommendation(
+    ticket_id: int,
+    recommendation_id: int,
+    idempotency_key: str = Header(min_length=8, max_length=200, alias="Idempotency-Key"),
+    db: Session = Depends(get_db),
+) -> ActionExecution:
+    recommendation = _get_recommendation(db, ticket_id, recommendation_id)
+    decision = recommendation.approval
+    if decision is not None and decision.decision == "rejected":
+        raise HTTPException(status_code=409, detail="Rejected recommendations cannot be executed")
+    if recommendation.requires_approval and (
+        decision is None or decision.decision != "approved"
+    ):
+        raise HTTPException(status_code=409, detail="Approval is required before execution")
+
+    execution = db.scalar(
+        select(ActionExecution).where(ActionExecution.idempotency_key == idempotency_key)
+    )
+    if execution is not None and execution.recommendation_id != recommendation.id:
+        raise HTTPException(status_code=409, detail="Idempotency key belongs to another action")
+    if execution is not None and execution.status == "completed":
+        return execution
+    if execution is not None and execution.status == "executing":
+        raise HTTPException(status_code=409, detail="Action execution is already in progress")
+
+    recommendation_execution = recommendation.execution
+    if recommendation_execution is not None and execution is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This recommendation already used a different idempotency key",
+        )
+
+    if execution is None:
+        execution = ActionExecution(
+            recommendation_id=recommendation.id,
+            ticket_id=ticket_id,
+            action=recommendation.recommended_action,
+            idempotency_key=idempotency_key,
+            status="executing",
+            attempts=1,
+            result={},
+        )
+        recommendation.execution = execution
+        db.add(execution)
+    else:
+        execution.status = "executing"
+        execution.error = None
+        execution.attempts += 1
+
+    db.add(
+        AuditEvent(
+            ticket_id=ticket_id,
+            event_type="action_execution_started",
+            message=f"Executing action: {recommendation.recommended_action}",
+            event_metadata={
+                "recommendation_id": recommendation.id,
+                "idempotency_key": idempotency_key,
+                "attempt": execution.attempts,
+            },
+        )
+    )
+    db.commit()
+    db.refresh(execution)
+
+    ticket = db.get(Ticket, ticket_id)
+    if ticket is None:  # Defensive: the foreign key should make this impossible.
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    try:
+        result = actions.execute_simulated_action(ticket, recommendation, idempotency_key)
+    except RuntimeError as exc:
+        execution.status = "failed"
+        execution.error = str(exc)
+        db.add(
+            AuditEvent(
+                ticket_id=ticket_id,
+                event_type="action_execution_failed",
+                message=f"Action execution failed: {exc}",
+                event_metadata={
+                    "recommendation_id": recommendation.id,
+                    "attempt": execution.attempts,
+                },
+            )
+        )
+        db.commit()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    execution.status = "completed"
+    execution.external_reference = result.external_reference
+    execution.result = result.details
+    execution.error = None
+    execution.completed_at = datetime.now(UTC)
+    ticket.status = (
+        "in_progress"
+        if recommendation.recommended_action
+        in {"request_more_information", "escalate", "review_invoice"}
+        else "resolved"
+    )
+    db.add(
+        AuditEvent(
+            ticket_id=ticket_id,
+            event_type="action_execution_completed",
+            message=f"Completed action: {recommendation.recommended_action}",
+            event_metadata={
+                "recommendation_id": recommendation.id,
+                "external_reference": result.external_reference,
+                "idempotency_key": idempotency_key,
+            },
+        )
+    )
+    db.commit()
+    db.refresh(execution)
+    return execution
 
 
 @app.get("/tickets/{ticket_id}/recommendations", response_model=list[RecommendationRead])

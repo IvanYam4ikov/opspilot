@@ -26,6 +26,40 @@ export interface EvidenceItem {
   detail: string;
 }
 
+export type WorkflowState =
+  | "pending_approval"
+  | "ready"
+  | "approved"
+  | "rejected"
+  | "executing"
+  | "completed"
+  | "failed";
+
+export interface ApprovalDecision {
+  id: number;
+  recommendation_id: number;
+  ticket_id: number;
+  decision: "approved" | "rejected";
+  reviewer: string;
+  note: string | null;
+  created_at: string;
+}
+
+export interface ActionExecution {
+  id: number;
+  recommendation_id: number;
+  ticket_id: number;
+  action: string;
+  idempotency_key: string;
+  status: "executing" | "completed" | "failed";
+  attempts: number;
+  external_reference: string | null;
+  result: Record<string, unknown>;
+  error: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
 export interface Recommendation {
   id: number;
   ticket_id: number;
@@ -37,6 +71,9 @@ export interface Recommendation {
   requires_approval: boolean;
   provider: string;
   created_at: string;
+  workflow_state: WorkflowState;
+  approval: ApprovalDecision | null;
+  execution: ActionExecution | null;
 }
 
 export interface AuditEvent {
@@ -73,5 +110,20 @@ export const api = {
     request<Recommendation>(`/tickets/${id}/investigate`, { method: "POST" }),
   getRecommendations: (id: number) =>
     request<Recommendation[]>(`/tickets/${id}/recommendations`),
+  approveRecommendation: (ticketId: number, recommendationId: number, reviewer: string, note: string) =>
+    request<Recommendation>(`/tickets/${ticketId}/recommendations/${recommendationId}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ reviewer, note: note || null }),
+    }),
+  rejectRecommendation: (ticketId: number, recommendationId: number, reviewer: string, note: string) =>
+    request<Recommendation>(`/tickets/${ticketId}/recommendations/${recommendationId}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ reviewer, note: note || null }),
+    }),
+  executeRecommendation: (ticketId: number, recommendationId: number, idempotencyKey: string) =>
+    request<ActionExecution>(`/tickets/${ticketId}/recommendations/${recommendationId}/execute`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+    }),
   getEvents: (id: number) => request<AuditEvent[]>(`/tickets/${id}/events`),
 };

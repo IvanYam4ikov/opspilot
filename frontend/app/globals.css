@@ -107,6 +107,28 @@ select:focus, input:focus, textarea:focus { border-color: #61a083; box-shadow: 0
 .recommended-action div span { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .08em; }
 .recommended-action div strong { font-size: 12px; }
 .approval-chip { padding: 5px 8px; border-radius: 5px; background: #fff0d6; color: #805315; font-size: 9px; font-weight: 800; text-transform: uppercase; }
+.workflow-chip { flex: 0 0 auto; padding: 5px 8px; border-radius: 5px; background: #edf0ef; color: #65726d; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
+.workflow-chip.pending_approval { background: #fff0d6; color: #805315; }
+.workflow-chip.approved, .workflow-chip.ready { background: var(--mint); color: var(--green-dark); }
+.workflow-chip.rejected, .workflow-chip.failed { background: #fde6e5; color: #9e3732; }
+.workflow-chip.completed { background: var(--green); color: white; }
+.approval-panel { border-top: 1px solid var(--line); padding: 18px 20px; display: grid; gap: 15px; background: #fffcf5; }
+.approval-panel > div > p:not(.section-label), .execution-panel p:not(.section-label) { margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.review-fields { display: grid; grid-template-columns: minmax(150px, .7fr) minmax(220px, 1.3fr); gap: 12px; }
+.review-fields textarea { resize: vertical; }
+.workflow-actions { display: flex; justify-content: flex-end; gap: 9px; }
+.reject-button { color: #9e3732; border-color: #efc6c3; }
+.decision-summary { margin: 0 20px 18px; padding: 12px 13px; border-radius: 9px; background: #eef9f3; color: var(--green-dark); }
+.decision-summary.rejected { background: #fff1f0; color: #8d302d; }
+.decision-summary strong { font-size: 11px; }
+.decision-summary p { margin: 5px 0; color: inherit; font-size: 11px; line-height: 1.45; }
+.decision-summary time { color: var(--muted); font-size: 9px; }
+.execution-panel { border-top: 1px solid var(--line); padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.execution-panel > div { min-width: 0; }
+.execution-panel .primary-button { flex: 0 0 auto; }
+.execution-result { margin: 0 20px 18px; padding: 13px; border-radius: 9px; background: #eef9f3; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.execution-result strong { font-size: 11px; }
+.execution-result > span { color: var(--green-dark); font-family: monospace; font-size: 10px; }
 .recommendation-footer { border-top: 1px solid var(--line); padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; color: #8b9691; font-size: 9px; }
 .recommendation-footer button { border: 0; background: transparent; color: var(--green); font-size: 10px; font-weight: 800; }
 .timeline { margin-top: 28px; }
@@ -145,4 +167,6 @@ select:focus, input:focus, textarea:focus { border-color: #61a083; box-shadow: 0
   .ticket-list { padding-inline: 10px; }
   .detail-panel { padding: 28px 20px; }
   .split-fields { grid-template-columns: 1fr; }
+  .review-fields { grid-template-columns: 1fr; }
+  .execution-panel, .execution-result { align-items: stretch; flex-direction: column; }
 }
