@@ -23,10 +23,32 @@ services:
       INVESTIGATION_MODE: ${INVESTIGATION_MODE:-demo}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      AUTH_SECRET: ${AUTH_SECRET:-local-compose-secret-change-before-deploying}
+      AUTO_CREATE_SCHEMA: "false"
     ports:
       - "8000:8000"
+    command: ["sh", "-c", "alembic upgrade head && python -m app.seed && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
     depends_on:
       db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  worker:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://opspilot:opspilot@db:5432/opspilot
+      INVESTIGATION_MODE: ${INVESTIGATION_MODE:-demo}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      AUTH_SECRET: ${AUTH_SECRET:-local-compose-secret-change-before-deploying}
+      AUTO_CREATE_SCHEMA: "false"
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      api:
         condition: service_healthy
 
   frontend:
@@ -37,7 +59,8 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
 volumes:
   postgres_data:

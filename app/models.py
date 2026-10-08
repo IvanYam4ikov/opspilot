@@ -1,6 +1,17 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Integer, Numeric, String, Text, func
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -18,6 +29,18 @@ class Customer(Base):
     tickets: Mapped[list["Ticket"]] = relationship(back_populates="customer")
     account: Mapped["Account | None"] = relationship(back_populates="customer")
     invoices: Mapped[list["Invoice"]] = relationship(back_populates="customer")
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(200))
+    password_hash: Mapped[str] = mapped_column(String(500))
+    role: Mapped[str] = mapped_column(String(30), index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class Ticket(Base):
@@ -143,6 +166,31 @@ class ActionExecution(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     recommendation: Mapped[Recommendation] = relationship(back_populates="execution")
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_type: Mapped[str] = mapped_column(String(50), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    ticket_id: Mapped[int | None] = mapped_column(ForeignKey("tickets.id"), index=True)
+    recommendation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("recommendations.id"), index=True
+    )
+    requested_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(200), unique=True, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str | None] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AuditEvent(Base):

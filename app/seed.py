@@ -2,14 +2,22 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select
 
+from app.auth import hash_password
 from app.database import Base, SessionLocal, engine
 from app.evaluation_cases import EVALUATION_CASES
-from app.models import Account, AuditEvent, Customer, Invoice, KnowledgeArticle, Ticket
+from app.models import Account, AuditEvent, Customer, Invoice, KnowledgeArticle, Ticket, User
+
+DEMO_USERS = (
+    ("operator@opspilot.example", "Demo Operator", "operator", "demo-operator"),
+    ("approver@opspilot.example", "Demo Approver", "approver", "demo-approver"),
+    ("admin@opspilot.example", "Demo Administrator", "admin", "demo-admin"),
+)
 
 
 def seed() -> None:
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
+        seed_demo_users(db)
         customer = db.scalar(select(Customer).where(Customer.email == "ops@acme.example"))
         if customer is None:
             customer = Customer(
@@ -106,6 +114,20 @@ def seed() -> None:
         print("Demo data and AI evaluation tickets are ready.")
 
 
+def seed_demo_users(db) -> None:
+    for email, display_name, role, password in DEMO_USERS:
+        if db.scalar(select(User.id).where(User.email == email)) is None:
+            db.add(
+                User(
+                    email=email,
+                    display_name=display_name,
+                    role=role,
+                    password_hash=hash_password(password),
+                )
+            )
+    db.flush()
+
+
 def seed_evaluation_cases(db) -> None:
     for case in EVALUATION_CASES:
         customer = db.scalar(select(Customer).where(Customer.email == case.customer_email))
@@ -118,9 +140,10 @@ def seed_evaluation_cases(db) -> None:
             db.add(customer)
             db.flush()
 
-        if case.plan_name and db.scalar(
-            select(Account.id).where(Account.customer_id == customer.id)
-        ) is None:
+        if (
+            case.plan_name
+            and db.scalar(select(Account.id).where(Account.customer_id == customer.id)) is None
+        ):
             db.add(
                 Account(
                     customer_id=customer.id,
@@ -132,9 +155,10 @@ def seed_evaluation_cases(db) -> None:
             )
 
         for invoice in case.invoices:
-            if db.scalar(
-                select(Invoice.id).where(Invoice.invoice_number == invoice.number)
-            ) is None:
+            if (
+                db.scalar(select(Invoice.id).where(Invoice.invoice_number == invoice.number))
+                is None
+            ):
                 db.add(
                     Invoice(
                         customer_id=customer.id,

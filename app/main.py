@@ -1,44 +1,52 @@
+import logging
+import time
+import uuid
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import actions
+from app.auth import authenticate_user, create_access_token, get_current_user, require_roles
 from app.config import settings
 from app.database import Base, engine, get_db
-from app.investigation import generate_recommendation, retrieve_context
 from app.models import (
-    ActionExecution,
     ApprovalDecision,
     AuditEvent,
     Customer,
+    Job,
     Recommendation,
     Ticket,
+    User,
 )
 from app.schemas import (
-    ActionExecutionRead,
     ApprovalDecisionCreate,
     AuditEventRead,
     CustomerCreate,
     CustomerRead,
+    JobRead,
+    LoginRequest,
     RecommendationRead,
     TicketCreate,
     TicketRead,
     TicketUpdate,
+    TokenRead,
+    UserRead,
 )
+
+logger = logging.getLogger("opspilot.api")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    if settings.auto_create_schema:
+        Base.metadata.create_all(bind=engine)
     yield
 
 
-app = FastAPI(title="OpsPilot API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="OpsPilot API", version="0.2.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -48,13 +56,54 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def request_observability(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    started = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = round((time.perf_counter() - started) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
+    logger.info(
+        "request_completed request_id=%s method=%s path=%s status=%s duration_ms=%s",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/auth/login", response_model=TokenRead)
+def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict:
+    user = authenticate_user(db, str(payload.email), payload.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token, expires_in = create_access_token(user)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": expires_in,
+        "user": user,
+    }
+
+
+@app.get("/auth/me", response_model=UserRead)
+def current_user(user: User = Depends(get_current_user)) -> User:
+    return user
+
+
 @app.post("/customers", response_model=CustomerRead, status_code=status.HTTP_201_CREATED)
-def create_customer(payload: CustomerCreate, db: Session = Depends(get_db)) -> Customer:
+def create_customer(
+    payload: CustomerCreate,
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_roles("operator", "admin")),
+) -> Customer:
     customer = Customer(**payload.model_dump())
     db.add(customer)
     try:
@@ -69,12 +118,18 @@ def create_customer(payload: CustomerCreate, db: Session = Depends(get_db)) -> C
 
 
 @app.get("/customers", response_model=list[CustomerRead])
-def list_customers(db: Session = Depends(get_db)) -> list[Customer]:
+def list_customers(
+    db: Session = Depends(get_db), _user: User = Depends(get_current_user)
+) -> list[Customer]:
     return list(db.scalars(select(Customer).order_by(Customer.name)))
 
 
 @app.get("/customers/{customer_id}", response_model=CustomerRead)
-def get_customer(customer_id: int, db: Session = Depends(get_db)) -> Customer:
+def get_customer(
+    customer_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> Customer:
     customer = db.get(Customer, customer_id)
     if customer is None:
         raise HTTPException(status_code=404, detail="Customer not found")
@@ -86,6 +141,7 @@ def list_tickets(
     ticket_status: str | None = Query(default=None, alias="status"),
     priority: str | None = None,
     db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
 ) -> list[Ticket]:
     query = select(Ticket).order_by(Ticket.created_at.desc())
     if ticket_status:
@@ -96,7 +152,11 @@ def list_tickets(
 
 
 @app.get("/tickets/{ticket_id}", response_model=TicketRead)
-def get_ticket(ticket_id: int, db: Session = Depends(get_db)) -> Ticket:
+def get_ticket(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> Ticket:
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
@@ -104,7 +164,11 @@ def get_ticket(ticket_id: int, db: Session = Depends(get_db)) -> Ticket:
 
 
 @app.post("/tickets", response_model=TicketRead, status_code=status.HTTP_201_CREATED)
-def create_ticket(payload: TicketCreate, db: Session = Depends(get_db)) -> Ticket:
+def create_ticket(
+    payload: TicketCreate,
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_roles("operator", "admin")),
+) -> Ticket:
     if db.get(Customer, payload.customer_id) is None:
         raise HTTPException(status_code=404, detail="Customer not found")
     ticket = Ticket(**payload.model_dump())
@@ -124,7 +188,12 @@ def create_ticket(payload: TicketCreate, db: Session = Depends(get_db)) -> Ticke
 
 
 @app.patch("/tickets/{ticket_id}", response_model=TicketRead)
-def update_ticket(ticket_id: int, payload: TicketUpdate, db: Session = Depends(get_db)) -> Ticket:
+def update_ticket(
+    ticket_id: int,
+    payload: TicketUpdate,
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_roles("operator", "admin")),
+) -> Ticket:
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
@@ -147,59 +216,49 @@ def update_ticket(ticket_id: int, payload: TicketUpdate, db: Session = Depends(g
 
 @app.post(
     "/tickets/{ticket_id}/investigate",
-    response_model=RecommendationRead,
-    status_code=status.HTTP_201_CREATED,
+    response_model=JobRead,
+    status_code=status.HTTP_202_ACCEPTED,
 )
-def investigate_ticket(ticket_id: int, db: Session = Depends(get_db)) -> Recommendation:
+def investigate_ticket(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_roles("operator", "admin")),
+) -> Job:
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
-
+    existing = db.scalar(
+        select(Job)
+        .where(
+            Job.job_type == "investigation",
+            Job.ticket_id == ticket_id,
+            Job.status.in_(("queued", "running")),
+        )
+        .order_by(Job.created_at.desc())
+    )
+    if existing is not None:
+        return existing
+    job = Job(
+        job_type="investigation",
+        status="queued",
+        ticket_id=ticket_id,
+        requested_by_id=user.id,
+        payload={},
+        result={},
+    )
+    db.add(job)
+    db.flush()
     db.add(
         AuditEvent(
             ticket_id=ticket.id,
-            event_type="investigation_started",
-            message="Investigation started",
-            event_metadata={},
+            event_type="investigation_queued",
+            message="Investigation queued",
+            event_metadata={"job_id": job.id, "requested_by": user.email},
         )
     )
-    try:
-        context = retrieve_context(db, ticket)
-        result, provider = generate_recommendation(context)
-    except (RuntimeError, ValueError) as exc:
-        db.rollback()
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    recommendation = Recommendation(
-        ticket_id=ticket.id,
-        provider=provider,
-        **result.model_dump(mode="json"),
-    )
-    db.add(recommendation)
-    db.flush()
-    db.add_all(
-        [
-            AuditEvent(
-                ticket_id=ticket.id,
-                event_type="evidence_retrieved",
-                message=f"Retrieved {len(result.evidence)} evidence sources",
-                event_metadata={"sources": [item.source_id for item in result.evidence]},
-            ),
-            AuditEvent(
-                ticket_id=ticket.id,
-                event_type="recommendation_generated",
-                message=f"Recommended action: {result.recommended_action}",
-                event_metadata={
-                    "recommendation_id": recommendation.id,
-                    "confidence": result.confidence,
-                    "provider": provider,
-                },
-            ),
-        ]
-    )
     db.commit()
-    db.refresh(recommendation)
-    return recommendation
+    db.refresh(job)
+    return job
 
 
 def _get_recommendation(db: Session, ticket_id: int, recommendation_id: int) -> Recommendation:
@@ -215,6 +274,7 @@ def _record_decision(
     recommendation_id: int,
     payload: ApprovalDecisionCreate,
     decision_value: str,
+    user: User,
 ) -> Recommendation:
     recommendation = _get_recommendation(db, ticket_id, recommendation_id)
     if recommendation.execution is not None:
@@ -228,7 +288,7 @@ def _record_decision(
         recommendation_id=recommendation.id,
         ticket_id=ticket_id,
         decision=decision_value,
-        reviewer=payload.reviewer,
+        reviewer=user.display_name,
         note=payload.note,
     )
     recommendation.approval = decision
@@ -238,10 +298,11 @@ def _record_decision(
             AuditEvent(
                 ticket_id=ticket_id,
                 event_type=f"recommendation_{decision_value}",
-                message=f"Recommendation {decision_value} by {payload.reviewer}",
+                message=f"Recommendation {decision_value} by {user.display_name}",
                 event_metadata={
                     "recommendation_id": recommendation.id,
-                    "reviewer": payload.reviewer,
+                    "reviewer": user.display_name,
+                    "reviewer_user_id": user.id,
                     "note": payload.note,
                 },
             ),
@@ -261,8 +322,9 @@ def approve_recommendation(
     recommendation_id: int,
     payload: ApprovalDecisionCreate,
     db: Session = Depends(get_db),
+    user: User = Depends(require_roles("approver", "admin")),
 ) -> Recommendation:
-    return _record_decision(db, ticket_id, recommendation_id, payload, "approved")
+    return _record_decision(db, ticket_id, recommendation_id, payload, "approved", user)
 
 
 @app.post(
@@ -274,130 +336,85 @@ def reject_recommendation(
     recommendation_id: int,
     payload: ApprovalDecisionCreate,
     db: Session = Depends(get_db),
+    user: User = Depends(require_roles("approver", "admin")),
 ) -> Recommendation:
-    return _record_decision(db, ticket_id, recommendation_id, payload, "rejected")
+    return _record_decision(db, ticket_id, recommendation_id, payload, "rejected", user)
 
 
 @app.post(
     "/tickets/{ticket_id}/recommendations/{recommendation_id}/execute",
-    response_model=ActionExecutionRead,
+    response_model=JobRead,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 def execute_recommendation(
     ticket_id: int,
     recommendation_id: int,
     idempotency_key: str = Header(min_length=8, max_length=200, alias="Idempotency-Key"),
     db: Session = Depends(get_db),
-) -> ActionExecution:
+    user: User = Depends(require_roles("operator", "approver", "admin")),
+) -> Job:
     recommendation = _get_recommendation(db, ticket_id, recommendation_id)
     decision = recommendation.approval
     if decision is not None and decision.decision == "rejected":
         raise HTTPException(status_code=409, detail="Rejected recommendations cannot be executed")
-    if recommendation.requires_approval and (
-        decision is None or decision.decision != "approved"
-    ):
+    if recommendation.requires_approval and (decision is None or decision.decision != "approved"):
         raise HTTPException(status_code=409, detail="Approval is required before execution")
 
-    execution = db.scalar(
-        select(ActionExecution).where(ActionExecution.idempotency_key == idempotency_key)
-    )
-    if execution is not None and execution.recommendation_id != recommendation.id:
-        raise HTTPException(status_code=409, detail="Idempotency key belongs to another action")
-    if execution is not None and execution.status == "completed":
-        return execution
-    if execution is not None and execution.status == "executing":
-        raise HTTPException(status_code=409, detail="Action execution is already in progress")
+    existing_job = db.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
+    if existing_job is not None:
+        if existing_job.recommendation_id != recommendation.id:
+            raise HTTPException(status_code=409, detail="Idempotency key belongs to another action")
+        if existing_job.status == "failed":
+            existing_job.status = "queued"
+            existing_job.attempts = 0
+            existing_job.error = None
+            existing_job.completed_at = None
+            db.commit()
+            db.refresh(existing_job)
+        return existing_job
 
-    recommendation_execution = recommendation.execution
-    if recommendation_execution is not None and execution is None:
+    if recommendation.execution is not None:
         raise HTTPException(
             status_code=409,
             detail="This recommendation already used a different idempotency key",
         )
 
-    if execution is None:
-        execution = ActionExecution(
-            recommendation_id=recommendation.id,
-            ticket_id=ticket_id,
-            action=recommendation.recommended_action,
-            idempotency_key=idempotency_key,
-            status="executing",
-            attempts=1,
-            result={},
-        )
-        recommendation.execution = execution
-        db.add(execution)
-    else:
-        execution.status = "executing"
-        execution.error = None
-        execution.attempts += 1
-
+    job = Job(
+        job_type="action_execution",
+        status="queued",
+        ticket_id=ticket_id,
+        recommendation_id=recommendation.id,
+        requested_by_id=user.id,
+        idempotency_key=idempotency_key,
+        payload={"action": recommendation.recommended_action},
+        result={},
+    )
+    db.add(job)
+    db.flush()
     db.add(
         AuditEvent(
             ticket_id=ticket_id,
-            event_type="action_execution_started",
-            message=f"Executing action: {recommendation.recommended_action}",
+            event_type="action_execution_queued",
+            message=f"Queued action: {recommendation.recommended_action}",
             event_metadata={
+                "job_id": job.id,
                 "recommendation_id": recommendation.id,
                 "idempotency_key": idempotency_key,
-                "attempt": execution.attempts,
+                "requested_by": user.email,
             },
         )
     )
     db.commit()
-    db.refresh(execution)
-
-    ticket = db.get(Ticket, ticket_id)
-    if ticket is None:  # Defensive: the foreign key should make this impossible.
-        raise HTTPException(status_code=404, detail="Ticket not found")
-    try:
-        result = actions.execute_simulated_action(ticket, recommendation, idempotency_key)
-    except RuntimeError as exc:
-        execution.status = "failed"
-        execution.error = str(exc)
-        db.add(
-            AuditEvent(
-                ticket_id=ticket_id,
-                event_type="action_execution_failed",
-                message=f"Action execution failed: {exc}",
-                event_metadata={
-                    "recommendation_id": recommendation.id,
-                    "attempt": execution.attempts,
-                },
-            )
-        )
-        db.commit()
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    execution.status = "completed"
-    execution.external_reference = result.external_reference
-    execution.result = result.details
-    execution.error = None
-    execution.completed_at = datetime.now(UTC)
-    ticket.status = (
-        "in_progress"
-        if recommendation.recommended_action
-        in {"request_more_information", "escalate", "review_invoice"}
-        else "resolved"
-    )
-    db.add(
-        AuditEvent(
-            ticket_id=ticket_id,
-            event_type="action_execution_completed",
-            message=f"Completed action: {recommendation.recommended_action}",
-            event_metadata={
-                "recommendation_id": recommendation.id,
-                "external_reference": result.external_reference,
-                "idempotency_key": idempotency_key,
-            },
-        )
-    )
-    db.commit()
-    db.refresh(execution)
-    return execution
+    db.refresh(job)
+    return job
 
 
 @app.get("/tickets/{ticket_id}/recommendations", response_model=list[RecommendationRead])
-def list_recommendations(ticket_id: int, db: Session = Depends(get_db)) -> list[Recommendation]:
+def list_recommendations(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> list[Recommendation]:
     if db.get(Ticket, ticket_id) is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
     return list(
@@ -410,7 +427,11 @@ def list_recommendations(ticket_id: int, db: Session = Depends(get_db)) -> list[
 
 
 @app.get("/tickets/{ticket_id}/events", response_model=list[AuditEventRead])
-def list_audit_events(ticket_id: int, db: Session = Depends(get_db)) -> list[AuditEvent]:
+def list_audit_events(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> list[AuditEvent]:
     if db.get(Ticket, ticket_id) is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
     return list(
@@ -420,3 +441,45 @@ def list_audit_events(ticket_id: int, db: Session = Depends(get_db)) -> list[Aud
             .order_by(AuditEvent.created_at)
         )
     )
+
+
+@app.get("/jobs/{job_id}", response_model=JobRead)
+def get_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    _user: User = Depends(get_current_user),
+) -> Job:
+    job = db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@app.get("/ops/metrics")
+def operational_metrics(
+    db: Session = Depends(get_db),
+    _user: User = Depends(require_roles("approver", "admin")),
+) -> dict:
+    jobs = list(db.scalars(select(Job)))
+    completed_durations = [
+        float(job.result["duration_ms"])
+        for job in jobs
+        if job.status == "completed" and "duration_ms" in job.result
+    ]
+    status_counts = {
+        value: int(db.scalar(select(func.count()).where(Job.status == value)) or 0)
+        for value in ("queued", "running", "completed", "failed")
+    }
+    return {
+        "jobs": {
+            "total": len(jobs),
+            "by_status": status_counts,
+            "average_duration_ms": (
+                round(sum(completed_durations) / len(completed_durations), 2)
+                if completed_durations
+                else None
+            ),
+        },
+        "recommendations": int(db.scalar(select(func.count(Recommendation.id))) or 0),
+        "approval_decisions": int(db.scalar(select(func.count(ApprovalDecision.id))) or 0),
+    }

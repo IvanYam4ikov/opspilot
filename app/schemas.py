@@ -33,6 +33,8 @@ WorkflowState = Literal[
     "completed",
     "failed",
 ]
+UserRole = Literal["operator", "approver", "admin"]
+JobStatus = Literal["queued", "running", "completed", "failed"]
 
 
 class CustomerCreate(BaseModel):
@@ -119,7 +121,6 @@ class InvestigationResult(BaseModel):
 
 
 class ApprovalDecisionCreate(BaseModel):
-    reviewer: str = Field(min_length=1, max_length=200)
     note: str | None = Field(default=None, max_length=2000)
 
 
@@ -130,6 +131,7 @@ class ApprovalDecisionRead(ApprovalDecisionCreate):
     recommendation_id: int
     ticket_id: int
     decision: Literal["approved", "rejected"]
+    reviewer: str
     created_at: datetime
 
 
@@ -171,3 +173,43 @@ class AuditEventRead(BaseModel):
     message: str
     event_metadata: dict
     created_at: datetime
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=200)
+
+
+class UserRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: EmailStr
+    display_name: str
+    role: UserRole
+
+
+class TokenRead(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int
+    user: UserRead
+
+
+class JobRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    job_type: Literal["investigation", "action_execution"]
+    status: JobStatus
+    ticket_id: int | None
+    recommendation_id: int | None
+    requested_by_id: int
+    idempotency_key: str | None
+    result: dict
+    error: str | None
+    attempts: int
+    max_attempts: int
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None

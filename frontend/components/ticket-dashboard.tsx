@@ -6,9 +6,13 @@ import {
   AuditEvent,
   Customer,
   Recommendation,
+  User,
   Ticket,
   TicketPriority,
   TicketStatus,
+  getAccessToken,
+  setAccessToken,
+  waitForJob,
 } from "@/lib/api";
 
 const statuses: TicketStatus[] = ["open", "in_progress", "resolved", "closed"];
@@ -22,6 +26,8 @@ const labels: Record<TicketStatus, string> = {
 };
 
 export function TicketDashboard() {
+  const [user, setUser] = useState<User | null>(null);
+  const [checkingAuth, setCheckingAuth] = useState(true);
   const [tickets, setTickets] = useState<Ticket[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -33,9 +39,9 @@ export function TicketDashboard() {
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [investigating, setInvestigating] = useState(false);
-  const [reviewer, setReviewer] = useState("Operations reviewer");
   const [reviewNote, setReviewNote] = useState("");
   const [workflowBusy, setWorkflowBusy] = useState(false);
+  const [activeJob, setActiveJob] = useState<string | null>(null);
   const executionKeys = useRef<Record<number, string>>({});
 
   const loadData = useCallback(async () => {
@@ -56,8 +62,19 @@ export function TicketDashboard() {
   }, []);
 
   useEffect(() => {
-    void loadData();
-  }, [loadData]);
+    if (!getAccessToken()) {
+      setCheckingAuth(false);
+      return;
+    }
+    api.getMe()
+      .then(setUser)
+      .catch(() => setAccessToken(null))
+      .finally(() => setCheckingAuth(false));
+  }, []);
+
+  useEffect(() => {
+    if (user) void loadData();
+  }, [loadData, user]);
 
   useEffect(() => {
     if (selectedId === null) return;
@@ -123,9 +140,11 @@ export function TicketDashboard() {
     setInvestigating(true);
     setError(null);
     try {
-      const result = await api.investigateTicket(selected.id);
-      setRecommendation(result);
-      setEvents(await api.getEvents(selected.id));
+      const job = await api.investigateTicket(selected.id);
+      setActiveJob(`Investigation job #${job.id} is ${job.status}`);
+      const completed = await waitForJob(job);
+      setActiveJob(`Investigation job #${completed.id} completed`);
+      await refreshInvestigation(selected.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Investigation failed");
     } finally {
@@ -144,16 +163,12 @@ export function TicketDashboard() {
 
   async function submitDecision(decision: "approve" | "reject") {
     if (!selected || !recommendation) return;
-    if (!reviewer.trim()) {
-      setError("Reviewer name is required");
-      return;
-    }
     setWorkflowBusy(true);
     setError(null);
     try {
       const updated = decision === "approve"
-        ? await api.approveRecommendation(selected.id, recommendation.id, reviewer.trim(), reviewNote.trim())
-        : await api.rejectRecommendation(selected.id, recommendation.id, reviewer.trim(), reviewNote.trim());
+        ? await api.approveRecommendation(selected.id, recommendation.id, reviewNote.trim())
+        : await api.rejectRecommendation(selected.id, recommendation.id, reviewNote.trim());
       setRecommendation(updated);
       setReviewNote("");
       setEvents(await api.getEvents(selected.id));
@@ -172,7 +187,10 @@ export function TicketDashboard() {
     setWorkflowBusy(true);
     setError(null);
     try {
-      await api.executeRecommendation(selected.id, recommendation.id, idempotencyKey);
+      const job = await api.executeRecommendation(selected.id, recommendation.id, idempotencyKey);
+      setActiveJob(`Execution job #${job.id} is ${job.status}`);
+      const completed = await waitForJob(job);
+      setActiveJob(`Execution job #${completed.id} completed`);
       await Promise.all([refreshInvestigation(selected.id), loadData()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Action execution failed");
@@ -180,6 +198,48 @@ export function TicketDashboard() {
     } finally {
       setWorkflowBusy(false);
     }
+  }
+
+  async function login(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setSaving(true);
+    setError(null);
+    try {
+      const response = await api.login(String(form.get("email")), String(form.get("password")));
+      setAccessToken(response.access_token);
+      setUser(response.user);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login failed");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function logout() {
+    setAccessToken(null);
+    setUser(null);
+    setTickets([]);
+    setCustomers([]);
+    setRecommendation(null);
+  }
+
+  if (checkingAuth) return <main className="login-shell"><p>Loading OpsPilot…</p></main>;
+  if (!user) {
+    return (
+      <main className="login-shell">
+        <form className="login-card" onSubmit={login}>
+          <div className="brand-mark">OP</div>
+          <div><p className="eyebrow">OPERATIONS CONTROL</p><h1>Sign in to OpsPilot</h1></div>
+          <p>Use an assigned role to investigate requests, approve recommendations, or execute actions.</p>
+          {error && <div className="login-error">{error}</div>}
+          <label>Email<input name="email" type="email" defaultValue="admin@opspilot.example" required /></label>
+          <label>Password<input name="password" type="password" defaultValue="demo-admin" required /></label>
+          <button className="primary-button" disabled={saving}>{saving ? "Signing in…" : "Sign in"}</button>
+          <small>Demo: admin@opspilot.example / demo-admin</small>
+        </form>
+      </main>
+    );
   }
 
   return (
@@ -191,7 +251,7 @@ export function TicketDashboard() {
           <button className="nav-item" aria-label="Knowledge base">◇</button>
           <button className="nav-item" aria-label="Analytics">⌗</button>
         </div>
-        <div className="avatar">IY</div>
+        <div className="avatar">{user.display_name.split(" ").map((part) => part[0]).join("").slice(0, 2)}</div>
       </aside>
 
       <section className="workspace">
@@ -200,7 +260,7 @@ export function TicketDashboard() {
             <p className="eyebrow">OPERATIONS CONTROL</p>
             <h1>Ticket queue</h1>
           </div>
-          <button className="primary-button" onClick={() => setShowCreate(true)}>+ New ticket</button>
+          <div className="user-controls"><div><strong>{user.display_name}</strong><span>{humanize(user.role)}</span></div><button className="secondary-button" onClick={logout}>Sign out</button>{(["operator", "admin"] as const).includes(user.role as "operator" | "admin") && <button className="primary-button" onClick={() => setShowCreate(true)}>+ New ticket</button>}</div>
         </header>
 
         {error && <div className="error-banner"><span>{error}</span><button onClick={loadData}>Retry</button></div>}
@@ -313,13 +373,15 @@ export function TicketDashboard() {
                       <div className="approval-panel">
                         <div><p className="section-label">Human review required</p><p>Verify the cited evidence before authorizing this action.</p></div>
                         <div className="review-fields">
-                          <label>Reviewer<input value={reviewer} maxLength={200} onChange={(event) => setReviewer(event.target.value)} /></label>
+                          <label>Reviewer<input value={`${user.display_name} (${humanize(user.role)})`} disabled /></label>
                           <label>Review note<textarea value={reviewNote} maxLength={2000} rows={3} placeholder="Optional rationale for the audit trail" onChange={(event) => setReviewNote(event.target.value)} /></label>
                         </div>
-                        <div className="workflow-actions">
-                          <button className="secondary-button reject-button" disabled={workflowBusy} onClick={() => void submitDecision("reject")}>Reject</button>
-                          <button className="primary-button" disabled={workflowBusy} onClick={() => void submitDecision("approve")}>{workflowBusy ? "Saving…" : "Approve recommendation"}</button>
-                        </div>
+                        {(["approver", "admin"] as const).includes(user.role as "approver" | "admin") ? (
+                          <div className="workflow-actions">
+                            <button className="secondary-button reject-button" disabled={workflowBusy} onClick={() => void submitDecision("reject")}>Reject</button>
+                            <button className="primary-button" disabled={workflowBusy} onClick={() => void submitDecision("approve")}>{workflowBusy ? "Saving…" : "Approve recommendation"}</button>
+                          </div>
+                        ) : <p className="role-notice">An approver or administrator must review this recommendation.</p>}
                       </div>
                     )}
                     {recommendation.approval && (
@@ -346,7 +408,7 @@ export function TicketDashboard() {
                         <span>{recommendation.execution.external_reference}</span>
                       </div>
                     )}
-                    <div className="recommendation-footer"><span>Generated via {recommendation.provider}</span><button onClick={() => void investigate()} disabled={investigating}>{investigating ? "Investigating…" : "Run again"}</button></div>
+                    <div className="recommendation-footer"><span>Generated via {recommendation.provider}{activeJob ? ` · ${activeJob}` : ""}</span><button onClick={() => void investigate()} disabled={investigating}>{investigating ? "Queued / running…" : "Run again"}</button></div>
                   </div>
                 ) : (
                   <div className="investigation-card">
